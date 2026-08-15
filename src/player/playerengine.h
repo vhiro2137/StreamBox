@@ -29,6 +29,8 @@ signals:
     void videoFrameReady(const QImage &image);
     void positionChanged(qint64 milliseconds);
     void bufferingChanged(bool buffering, int percent);
+    void seekabilityChanged(bool seekable);
+    void retrying(int attempt, int maximum, int delayMs);
     void playbackFinished();
     void playbackError(const QString &message, const QString &details);
 
@@ -67,6 +69,7 @@ public:
     qint64 position() const { return m_positionMs; }
     bool hasVideo() const { return m_hasVideo; }
     bool hasAudio() const { return m_hasAudio; }
+    bool isSeekable() const { return m_seekable; }
 
 signals:
     void stateChanged(PlayerEngine::State state);
@@ -74,6 +77,9 @@ signals:
     void positionChanged(qint64 milliseconds);
     void videoFrameReady(const QImage &image);
     void bufferingChanged(bool buffering, int percent);
+    void seekabilityChanged(bool seekable);
+    void retrying(int attempt, int maximum, int delayMs);
+    void audioOutputReady(const QString &deviceName);
     void errorOccurred(const QString &message, const QString &details);
     void finished();
 
@@ -81,6 +87,7 @@ private:
     void setState(State state);
     void resetAudio();
     void configureAudio(int sampleRate, int channels);
+    void reportAudioError(const QString &message);
 
     DecoderWorker *m_worker = nullptr;
     QAudioSink *m_audioSink = nullptr;
@@ -90,6 +97,7 @@ private:
     qint64 m_positionMs = 0;
     bool m_hasAudio = false;
     bool m_hasVideo = false;
+    bool m_seekable = false;
     bool m_muted = false;
     float m_volume = 0.7f;
 };

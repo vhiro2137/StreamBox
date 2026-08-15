@@ -28,6 +28,8 @@ qt_add_executable(StreamBox
     src/playerwidgets.cpp
     src/player/playerengine.h
     src/player/playerengine.cpp
+    src/player/playbackpolicy.h
+    src/player/playbackpolicy.cpp
 )
 
 target_include_directories(StreamBox PRIVATE "${FFMPEG_ROOT}/include")
@@ -56,6 +58,53 @@ install(TARGETS StreamBox
 )
 
 if(BUILD_TESTING)
+    find_package(Qt6 6.5 REQUIRED COMPONENTS Test Network)
+    qt_add_executable(playbackpolicy_test
+        tests/playbackpolicy_test.cpp
+        src/player/playbackpolicy.h
+        src/player/playbackpolicy.cpp)
+    target_include_directories(playbackpolicy_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(playbackpolicy_test PRIVATE Qt6::Test)
+    add_test(NAME playback_policy COMMAND playbackpolicy_test)
+    set_tests_properties(playback_policy PROPERTIES
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+    qt_add_executable(decoderworker_test
+        tests/decoderworker_test.cpp
+        src/player/playerengine.h
+        src/player/playerengine.cpp
+        src/player/playbackpolicy.h
+        src/player/playbackpolicy.cpp)
+    target_include_directories(decoderworker_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src" "${FFMPEG_ROOT}/include")
+    target_link_libraries(decoderworker_test PRIVATE
+        Qt6::Test Qt6::Multimedia Qt6::Network
+        ${FFMPEG_avformat_LIBRARY} ${FFMPEG_avcodec_LIBRARY}
+        ${FFMPEG_avfilter_LIBRARY} ${FFMPEG_swresample_LIBRARY}
+        ${FFMPEG_swscale_LIBRARY} ${FFMPEG_avutil_LIBRARY})
+    add_test(NAME decoder_worker COMMAND decoderworker_test)
+    set_tests_properties(decoder_worker PROPERTIES
+        TIMEOUT 25
+        ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>\;PATH=path_list_prepend:${FFMPEG_ROOT}/bin")
+
+    qt_add_executable(media_smoke
+        tests/media_smoke.cpp
+        src/player/playerengine.h
+        src/player/playerengine.cpp
+        src/player/playbackpolicy.h
+        src/player/playbackpolicy.cpp)
+    target_include_directories(media_smoke PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src" "${FFMPEG_ROOT}/include")
+    target_link_libraries(media_smoke PRIVATE
+        Qt6::Multimedia
+        ${FFMPEG_avformat_LIBRARY} ${FFMPEG_avcodec_LIBRARY}
+        ${FFMPEG_avfilter_LIBRARY} ${FFMPEG_swresample_LIBRARY}
+        ${FFMPEG_swscale_LIBRARY} ${FFMPEG_avutil_LIBRARY})
+
+    qt_add_executable(audio_device_test tests/audio_device_test.cpp)
+    target_link_libraries(audio_device_test PRIVATE Qt6::Multimedia)
+
     add_executable(ffmpeg_sdk_smoke scripts/verify_ffmpeg_sdk.c)
     target_include_directories(ffmpeg_sdk_smoke PRIVATE "${FFMPEG_ROOT}/include")
     target_link_libraries(ffmpeg_sdk_smoke PRIVATE

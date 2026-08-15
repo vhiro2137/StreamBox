@@ -1,10 +1,12 @@
 #include "playerengine.h"
+#include "playbackpolicy.h"
 
 #include <QAudioDevice>
 #include <QAudioSink>
 #include <QElapsedTimer>
 #include <QMediaDevices>
 #include <QMutex>
+#include <QTimer>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -12,7 +14,10 @@ extern "C" {
 #include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
-#include <libswresample/swresample.h>
+#include <libavutil/opt.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
 #include <libswscale/swscale.h>
 }
 
@@ -49,6 +54,44 @@ qint64 frameTimeMs(const AVFrame *frame, const AVStream *stream)
     if (timestamp == AV_NOPTS_VALUE) return -1;
     return qRound64(timestamp * av_q2d(stream->time_base) * 1000.0);
 }
+
+struct AudioFilter
+{
+    AVFilterGraph *graph = nullptr;
+    AVFilterContext *source = nullptr;
+    AVFilterContext *sink = nullptr;
+    double speed = 1.0;
+
+    ~AudioFilter() { avfilter_graph_free(&graph); }
+
+    bool rebuild(const AVCodecContext *codec, double requestedSpeed, QString &error)
+    {
+        avfilter_graph_free(&graph); source = sink = nullptr; speed = requestedSpeed;
+        graph = avfilter_graph_alloc();
+        if (!graph) { error = QStringLiteral("无法创建音频滤镜"); return false; }
+
+        char layout[128]{};
+        av_channel_layout_describe(&codec->ch_layout, layout, sizeof(layout));
+        const char *sampleFormat = av_get_sample_fmt_name(codec->sample_fmt);
+        const QByteArray sourceArgs = QStringLiteral("time_base=1/%1:sample_rate=%1:sample_fmt=%2:channel_layout=%3")
+            .arg(codec->sample_rate).arg(QString::fromLatin1(sampleFormat ? sampleFormat : "s16"), QString::fromLatin1(layout)).toUtf8();
+
+        AVFilterContext *tempo = nullptr;
+        AVFilterContext *format = nullptr;
+        int result = avfilter_graph_create_filter(&source, avfilter_get_by_name("abuffer"), "audio_source", sourceArgs.constData(), nullptr, graph);
+        const QByteArray tempoArgs = QByteArray::number(speed, 'f', 3);
+        if (result >= 0) result = avfilter_graph_create_filter(&tempo, avfilter_get_by_name("atempo"), "tempo", tempoArgs.constData(), nullptr, graph);
+        if (result >= 0) result = avfilter_graph_create_filter(&format, avfilter_get_by_name("aformat"), "format",
+            "sample_fmts=s16:sample_rates=48000:channel_layouts=stereo", nullptr, graph);
+        if (result >= 0) result = avfilter_graph_create_filter(&sink, avfilter_get_by_name("abuffersink"), "audio_sink", nullptr, nullptr, graph);
+        if (result >= 0) result = avfilter_link(source, 0, tempo, 0);
+        if (result >= 0) result = avfilter_link(tempo, 0, format, 0);
+        if (result >= 0) result = avfilter_link(format, 0, sink, 0);
+        if (result >= 0) result = avfilter_graph_config(graph, nullptr);
+        if (result < 0) { error = ffmpegError(result); avfilter_graph_free(&graph); source = sink = nullptr; return false; }
+        return true;
+    }
+};
 }
 
 DecoderWorker::DecoderWorker(QObject *parent) : QThread(parent) {}
@@ -68,28 +111,48 @@ void DecoderWorker::setSpeed(double speed) { m_speed = qBound(0.5, speed, 2.0); 
 void DecoderWorker::run()
 {
     avformat_network_init();
-    AVFormatContext *format = avformat_alloc_context();
-    if (!format) { emit playbackError(QStringLiteral("无法创建媒体读取器"), {}); return; }
-    format->interrupt_callback = {interruptCallback, &m_stop};
-
-    AVDictionary *options = nullptr;
     const bool network = m_source.startsWith(QStringLiteral("http://"), Qt::CaseInsensitive)
                       || m_source.startsWith(QStringLiteral("https://"), Qt::CaseInsensitive);
-    if (network) {
-        av_dict_set(&options, "timeout", "10000000", 0);
-        av_dict_set(&options, "rw_timeout", "10000000", 0);
-        av_dict_set(&options, "reconnect", "1", 0);
-        av_dict_set(&options, "reconnect_streamed", "1", 0);
-        av_dict_set(&options, "reconnect_delay_max", "4", 0);
-        emit bufferingChanged(true, -1);
-    }
     const QByteArray source = m_source.toUtf8();
-    int result = avformat_open_input(&format, source.constData(), nullptr, &options);
-    av_dict_free(&options);
+    AVFormatContext *format = nullptr;
+    int result = AVERROR_UNKNOWN;
+    const int maximumAttempts = network ? 4 : 1;
+    for (int attempt = 0; attempt < maximumAttempts && !m_stop; ++attempt) {
+        format = avformat_alloc_context();
+        if (!format) { emit playbackError(QStringLiteral("无法创建媒体读取器"), {}); avformat_network_deinit(); return; }
+        format->interrupt_callback = {interruptCallback, &m_stop};
+        AVDictionary *options = nullptr;
+        if (network) {
+            av_dict_set(&options, "timeout", "3000000", 0);
+            av_dict_set(&options, "rw_timeout", "3000000", 0);
+            av_dict_set(&options, "reconnect", "1", 0);
+            av_dict_set(&options, "reconnect_streamed", "1", 0);
+            av_dict_set(&options, "reconnect_on_network_error", "1", 0);
+            av_dict_set(&options, "reconnect_max_retries", "0", 0);
+            av_dict_set(&options, "reconnect_delay_max", "4", 0);
+            emit bufferingChanged(true, attempt == 0 ? 0 : -1);
+        }
+        result = avformat_open_input(&format, source.constData(), nullptr, &options);
+        av_dict_free(&options);
+        if (result >= 0) break;
+        avformat_free_context(format); format = nullptr;
+        if (network && attempt + 1 < maximumAttempts && !m_stop) {
+            const int retry = attempt + 1;
+            const int delay = PlaybackPolicy::retryDelayMs(retry);
+            emit retrying(retry, 3, delay);
+            for (int waited = 0; waited < delay && !m_stop; waited += 50) QThread::msleep(50);
+        }
+    }
     if (result < 0) {
-        const QString details = ffmpegError(result); avformat_free_context(format);
+        const QString details = ffmpegError(result); if (format) avformat_free_context(format);
         if (!m_stop) emit playbackError(network ? QStringLiteral("无法连接到网络媒体") : QStringLiteral("无法打开媒体文件"), details);
+        avformat_network_deinit();
         return;
+    }
+    if (network && format->pb) {
+        av_opt_set_int(format->pb, "reconnect_max_retries", 3, AV_OPT_SEARCH_CHILDREN);
+        av_opt_set_int(format->pb, "reconnect_delay_total_max", 7, AV_OPT_SEARCH_CHILDREN);
+        av_opt_set_int(format->pb, "reconnect_delay_max", 4, AV_OPT_SEARCH_CHILDREN);
     }
     result = avformat_find_stream_info(format, nullptr);
     if (result < 0) {
@@ -107,30 +170,32 @@ void DecoderWorker::run()
     }
 
     const qint64 durationMs = format->duration == AV_NOPTS_VALUE ? 0 : format->duration / (AV_TIME_BASE / 1000);
+    const bool seekable = PlaybackPolicy::isSeekable(durationMs, !format->pb || (format->pb->seekable & AVIO_SEEKABLE_NORMAL));
     QStringList description;
     if (videoCodec) description << QStringLiteral("%1×%2 · %3").arg(videoCodec->width).arg(videoCodec->height).arg(QString::fromUtf8(videoCodec->codec->name).toUpper());
     if (audioCodec) description << QString::fromUtf8(audioCodec->codec->name).toUpper();
     emit mediaOpened(durationMs, audioCodec != nullptr, videoCodec != nullptr, description.join(QStringLiteral(" · ")));
+    emit seekabilityChanged(seekable);
     if (network) emit bufferingChanged(false, 100);
 
     constexpr int outputRate = 48000;
-    constexpr AVSampleFormat outputFormat = AV_SAMPLE_FMT_S16;
-    AVChannelLayout outputLayout = AV_CHANNEL_LAYOUT_STEREO;
-    SwrContext *swr = nullptr;
+    constexpr int outputChannels = 2;
+    AudioFilter audioFilter;
     if (audioCodec) {
-        result = swr_alloc_set_opts2(&swr, &outputLayout, outputFormat, outputRate,
-                                     &audioCodec->ch_layout, audioCodec->sample_fmt, audioCodec->sample_rate, 0, nullptr);
-        if (result >= 0) result = swr_init(swr);
-        if (result < 0) { swr_free(&swr); avcodec_free_context(&audioCodec); audioCodec = nullptr; }
-        else emit audioFormatReady(outputRate, outputLayout.nb_channels);
+        if (!audioFilter.rebuild(audioCodec, m_speed.load(), decoderError)) { avcodec_free_context(&audioCodec); audioCodec = nullptr; }
+        else emit audioFormatReady(outputRate, outputChannels);
     }
 
     SwsContext *sws = nullptr;
     AVPacket *packet = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
+    AVFrame *filteredFrame = av_frame_alloc();
     QElapsedTimer videoClock; videoClock.start();
     qint64 videoBasePts = -1;
     qint64 lastPosition = -1;
+    qint64 audioClockMs = -1;
+    qint64 audioDiscardUntilMs = -1;
+    qint64 videoDiscardUntilMs = -1;
 
     auto handleFrame = [&](AVCodecContext *codec, AVStream *stream, bool audio) {
         while (!m_stop) {
@@ -138,19 +203,24 @@ void DecoderWorker::run()
             if (receive == AVERROR(EAGAIN) || receive == AVERROR_EOF) break;
             if (receive < 0) break;
             const qint64 ptsMs = frameTimeMs(frame, stream);
-            if (audio && swr) {
-                const int maxSamples = av_rescale_rnd(swr_get_delay(swr, codec->sample_rate) + frame->nb_samples,
-                                                      outputRate, codec->sample_rate, AV_ROUND_UP);
-                QByteArray pcm(maxSamples * outputLayout.nb_channels * av_get_bytes_per_sample(outputFormat), Qt::Uninitialized);
-                uint8_t *output[] = {reinterpret_cast<uint8_t *>(pcm.data())};
-                const int converted = swr_convert(swr, output, maxSamples,
-                                                  const_cast<const uint8_t **>(frame->extended_data), frame->nb_samples);
-                if (converted > 0) {
-                    pcm.resize(converted * outputLayout.nb_channels * av_get_bytes_per_sample(outputFormat));
-                    emit audioDataReady(pcm);
-                    const int sleepMs = qRound(1000.0 * converted / outputRate / m_speed.load());
-                    if (sleepMs > 0) QThread::msleep(qMin(sleepMs, 100));
+            qint64 &discardUntil = audio ? audioDiscardUntilMs : videoDiscardUntilMs;
+            if (discardUntil >= 0 && ptsMs >= 0) {
+                if (ptsMs < discardUntil) { av_frame_unref(frame); continue; }
+                discardUntil = -1;
+            }
+            if (audio && audioFilter.graph) {
+                const double requestedSpeed = m_speed.load();
+                if (!qFuzzyCompare(audioFilter.speed, requestedSpeed)) audioFilter.rebuild(codec, requestedSpeed, decoderError);
+                if (audioFilter.source && av_buffersrc_add_frame_flags(audioFilter.source, frame, AV_BUFFERSRC_FLAG_KEEP_REF) >= 0) {
+                    while (av_buffersink_get_frame(audioFilter.sink, filteredFrame) >= 0) {
+                        const int bytes = filteredFrame->nb_samples * outputChannels * 2;
+                        emit audioDataReady(QByteArray(reinterpret_cast<const char *>(filteredFrame->data[0]), bytes));
+                        const int sleepMs = qRound(1000.0 * filteredFrame->nb_samples / outputRate);
+                        if (sleepMs > 0) QThread::msleep(qMin(sleepMs, 100));
+                        av_frame_unref(filteredFrame);
+                    }
                 }
+                if (ptsMs >= 0) audioClockMs = ptsMs;
             } else if (!audio) {
                 sws = sws_getCachedContext(sws, frame->width, frame->height, static_cast<AVPixelFormat>(frame->format),
                                            frame->width, frame->height, AV_PIX_FMT_BGRA, SWS_BILINEAR, nullptr, nullptr, nullptr);
@@ -158,7 +228,11 @@ void DecoderWorker::run()
                     QImage image(frame->width, frame->height, QImage::Format_ARGB32);
                     uint8_t *dst[] = {image.bits()}; int lines[] = {int(image.bytesPerLine())};
                     sws_scale(sws, frame->data, frame->linesize, 0, frame->height, dst, lines);
-                    if (!audioCodec && ptsMs >= 0) {
+                    if (audioCodec && ptsMs >= 0 && audioClockMs >= 0) {
+                        const auto decision = PlaybackPolicy::videoDecision(ptsMs, audioClockMs);
+                        if (decision.action == PlaybackPolicy::VideoAction::Drop) { av_frame_unref(frame); continue; }
+                        if (decision.action == PlaybackPolicy::VideoAction::Delay) QThread::msleep(unsigned(decision.delayMs));
+                    } else if (!audioCodec && ptsMs >= 0) {
                         if (videoBasePts < 0) { videoBasePts = ptsMs; videoClock.restart(); }
                         const qint64 target = qRound64((ptsMs - videoBasePts) / m_speed.load());
                         const qint64 waitMs = target - videoClock.elapsed();
@@ -180,7 +254,10 @@ void DecoderWorker::run()
             if (avformat_seek_file(format, -1, INT64_MIN, target, INT64_MAX, AVSEEK_FLAG_BACKWARD) >= 0) {
                 if (audioCodec) avcodec_flush_buffers(audioCodec);
                 if (videoCodec) avcodec_flush_buffers(videoCodec);
-                if (swr) { swr_close(swr); swr_init(swr); }
+                if (audioCodec) audioFilter.rebuild(audioCodec, m_speed.load(), decoderError);
+                audioClockMs = -1;
+                audioDiscardUntilMs = audioCodec ? seekMs : -1;
+                videoDiscardUntilMs = videoCodec ? seekMs : -1;
                 videoBasePts = -1; videoClock.restart(); emit positionChanged(seekMs);
             }
         }
@@ -194,9 +271,9 @@ void DecoderWorker::run()
         av_packet_unref(packet);
     }
 
-    av_packet_free(&packet); av_frame_free(&frame); swr_free(&swr); sws_freeContext(sws);
+    av_packet_free(&packet); av_frame_free(&frame); av_frame_free(&filteredFrame); sws_freeContext(sws);
     avcodec_free_context(&audioCodec); avcodec_free_context(&videoCodec); avformat_close_input(&format);
-    av_channel_layout_uninit(&outputLayout); avformat_network_deinit();
+    avformat_network_deinit();
     if (!m_stop) emit playbackFinished();
 }
 
@@ -213,6 +290,8 @@ PlayerEngine::PlayerEngine(QObject *parent) : QObject(parent)
     connect(m_worker, &DecoderWorker::videoFrameReady, this, &PlayerEngine::videoFrameReady);
     connect(m_worker, &DecoderWorker::positionChanged, this, [this](qint64 position) { m_positionMs = position; emit positionChanged(position); });
     connect(m_worker, &DecoderWorker::bufferingChanged, this, [this](bool buffering, int percent) { if (buffering) setState(State::Buffering); emit bufferingChanged(buffering, percent); });
+    connect(m_worker, &DecoderWorker::seekabilityChanged, this, [this](bool seekable) { m_seekable = seekable; emit seekabilityChanged(seekable); });
+    connect(m_worker, &DecoderWorker::retrying, this, &PlayerEngine::retrying);
     connect(m_worker, &DecoderWorker::playbackFinished, this, [this] { resetAudio(); setState(State::Ended); emit finished(); });
     connect(m_worker, &DecoderWorker::playbackError, this, [this](const QString &message, const QString &details) { resetAudio(); setState(State::Error); emit errorOccurred(message, details); });
 }
@@ -221,12 +300,17 @@ PlayerEngine::~PlayerEngine() { stop(); }
 
 void PlayerEngine::open(const QString &source)
 {
-    stop(); m_durationMs = m_positionMs = 0; m_hasAudio = m_hasVideo = false; setState(State::Opening); m_worker->open(source);
+    stop(); m_durationMs = m_positionMs = 0; m_hasAudio = m_hasVideo = m_seekable = false; setState(State::Opening); m_worker->open(source);
 }
 void PlayerEngine::play() { if (m_state == State::Paused) { m_worker->requestPause(false); if (m_audioSink) m_audioSink->resume(); setState(State::Playing); } }
 void PlayerEngine::pause() { if (m_state == State::Playing) { m_worker->requestPause(true); if (m_audioSink) m_audioSink->suspend(); setState(State::Paused); } }
 void PlayerEngine::stop() { if (m_worker && m_worker->isRunning()) { m_worker->requestStop(); m_worker->wait(3000); } resetAudio(); if (m_state != State::Idle) setState(State::Stopped); }
-void PlayerEngine::seek(qint64 milliseconds) { if (m_worker->isRunning()) { if (m_audioSink) m_audioSink->reset(); m_worker->requestSeek(qBound<qint64>(0, milliseconds, m_durationMs)); } }
+void PlayerEngine::seek(qint64 milliseconds)
+{
+    if (!m_seekable || !m_worker->isRunning()) return;
+    if (m_audioSink) { m_audioSink->reset(); m_audioDevice = m_audioSink->start(); }
+    m_worker->requestSeek(qBound<qint64>(0, milliseconds, m_durationMs));
+}
 void PlayerEngine::setVolume(float volume) { m_volume = qBound(0.0f, volume, 1.0f); if (m_audioSink) m_audioSink->setVolume(m_muted ? 0.0f : m_volume); }
 void PlayerEngine::setMuted(bool muted) { m_muted = muted; if (m_audioSink) m_audioSink->setVolume(muted ? 0.0f : m_volume); }
 void PlayerEngine::setSpeed(double speed) { m_worker->setSpeed(speed); }
@@ -241,7 +325,24 @@ void PlayerEngine::configureAudio(int sampleRate, int channels)
 {
     resetAudio(); QAudioFormat format; format.setSampleRate(sampleRate); format.setChannelCount(channels); format.setSampleFormat(QAudioFormat::Int16);
     QAudioDevice device = QMediaDevices::defaultAudioOutput();
-    if (!device.isFormatSupported(format)) format = device.preferredFormat();
+    if (device.isNull()) { reportAudioError(QStringLiteral("未检测到可用的音频输出设备")); return; }
+    if (!device.isFormatSupported(format)) { reportAudioError(QStringLiteral("默认音频设备不支持 48 kHz 双声道 S16 输出")); return; }
     m_audioSink = new QAudioSink(device, format, this); m_audioSink->setBufferSize(sampleRate * channels * 2 / 2);
+    connect(m_audioSink, &QAudioSink::stateChanged, this, [this](QtAudio::State state) {
+        if (state == QtAudio::StoppedState && m_audioSink && m_audioSink->error() != QtAudio::NoError) {
+            const int errorCode = int(m_audioSink->error());
+            QTimer::singleShot(0, this, [this, errorCode] {
+                if (m_audioSink && m_audioSink->error() != QtAudio::NoError)
+                    reportAudioError(QStringLiteral("音频设备输出失败，错误码 %1").arg(errorCode));
+            });
+        }
+    });
     m_audioSink->setVolume(m_muted ? 0.0f : m_volume); m_audioDevice = m_audioSink->start();
+    if (!m_audioDevice) { reportAudioError(QStringLiteral("无法启动默认音频输出设备")); return; }
+    emit audioOutputReady(device.description());
+}
+
+void PlayerEngine::reportAudioError(const QString &message)
+{
+    resetAudio(); setState(State::Error); emit errorOccurred(message, QStringLiteral("请检查 Windows 默认输出设备、音量和独占模式设置。"));
 }

@@ -18,8 +18,12 @@ class MainWindow final : public QMainWindow
 public:
     explicit MainWindow(QWidget *parent = nullptr);
     void openMedia(const QString &source);
+    void setPlaybackSpeed(double speed);
+    void seekTo(qint64 milliseconds);
+    void setPlayerFullscreen(bool fullscreen);
 
 protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
 
@@ -76,6 +80,8 @@ private:
     QSlider *m_volume = nullptr;
     QTimer *m_toastTimer = nullptr;
     QTimer *m_progressTimer = nullptr;
+    QTimer *m_fullscreenControlsTimer = nullptr;
+    QWidget *m_controls = nullptr;
     PlayerEngine *m_engine = nullptr;
     bool m_playing = false;
     bool m_muted = false;
