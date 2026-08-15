@@ -1,10 +1,13 @@
 #include "mainwindow.h"
 #include "player/playerengine.h"
+#include "player/playbackpolicy.h"
 
 #include <QActionGroup>
+#include <QApplication>
 #include <QBoxLayout>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QEvent>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
@@ -70,6 +73,23 @@ void MainWindow::openMedia(const QString &source)
     } else addMediaFiles({source}, true);
 }
 
+void MainWindow::setPlaybackSpeed(double speed)
+{
+    const double bounded = qBound(0.5, speed, 2.0);
+    m_engine->setSpeed(bounded);
+    m_speedButton->setText(QString::number(bounded, 'f', bounded == qRound(bounded) ? 1 : 2) + QStringLiteral("×"));
+}
+
+void MainWindow::seekTo(qint64 milliseconds)
+{
+    m_engine->seek(milliseconds);
+}
+
+void MainWindow::setPlayerFullscreen(bool fullscreen)
+{
+    if (m_fullscreen != fullscreen) toggleFullscreen();
+}
+
 void MainWindow::buildUi()
 {
     auto *central = new QWidget(this);
@@ -92,7 +112,8 @@ void MainWindow::buildUi()
     m_workspace->setStretchFactor(1, 0);
     m_workspace->setSizes({920, 360});
     root->addWidget(m_workspace, 1);
-    root->addWidget(createControls());
+    m_controls = createControls();
+    root->addWidget(m_controls);
     setCentralWidget(central);
 
     m_toast = new QLabel(central);
@@ -105,6 +126,13 @@ void MainWindow::buildUi()
 
     m_progressTimer = new QTimer(this);
     m_progressTimer->setInterval(1000);
+    m_fullscreenControlsTimer = new QTimer(this);
+    m_fullscreenControlsTimer->setSingleShot(true);
+    m_fullscreenControlsTimer->setInterval(3000);
+    connect(m_fullscreenControlsTimer, &QTimer::timeout, this, [this] {
+        if (m_fullscreen && m_controls) m_controls->hide();
+    });
+    qApp->installEventFilter(this);
 }
 
 QWidget *MainWindow::createToolbar()
@@ -284,10 +312,9 @@ void MainWindow::connectActions()
     connect(m_canvas, &VideoCanvas::openUrlRequested, this, &MainWindow::openUrlDialog);
     connect(m_canvas, &VideoCanvas::fullscreenRequested, this, &MainWindow::toggleFullscreen);
     connect(m_canvas, &VideoCanvas::filesDropped, this, [this](const QStringList &files) { addMediaFiles(files); });
-    connect(m_canvas, &VideoCanvas::cancelRequested, this, [this] { setPlaybackState(VideoCanvas::State::Stopped, QStringLiteral("已取消")); });
+    connect(m_canvas, &VideoCanvas::cancelRequested, this, [this] { m_engine->stop(); setPlaybackState(VideoCanvas::State::Stopped, QStringLiteral("已取消")); });
     connect(m_canvas, &VideoCanvas::retryRequested, this, [this] {
-        setPlaybackState(VideoCanvas::State::Buffering, QStringLiteral("正在重试（1/3）"));
-        QTimer::singleShot(1200, this, [this] { setPlaybackState(VideoCanvas::State::Playing); });
+        if (m_playlist->currentRow() >= 0) selectItem(m_playlist->currentRow());
     });
     connect(m_playlist, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem *item) { selectItem(m_playlist->row(item)); });
     connect(m_playlist, &QListWidget::currentRowChanged, this, [this](int row) { if (row >= 0) updateCurrentMediaUi(); });
@@ -331,6 +358,18 @@ void MainWindow::connectActions()
         m_durationSeconds = int(durationMs / 1000); m_progress->setRange(0, qMax(0, m_durationSeconds));
         m_totalTime->setText(durationMs > 0 ? formatTime(m_durationSeconds) : QStringLiteral("未知"));
         m_mediaInfo->setText(description); m_fullscreenButton->setEnabled(video);
+    });
+    connect(m_engine, &PlayerEngine::seekabilityChanged, this, [this](bool seekable) {
+        m_progress->setEnabled(seekable);
+        if (!seekable) { m_progress->setRange(0, 0); m_totalTime->setText(QStringLiteral("直播")); }
+    });
+    connect(m_engine, &PlayerEngine::retrying, this, [this](int attempt, int maximum, int delayMs) {
+        setPlaybackState(VideoCanvas::State::Buffering,
+            QStringLiteral("网络连接中断，正在重试（%1/%2，%3 秒）").arg(attempt).arg(maximum).arg(delayMs / 1000));
+    });
+    connect(m_engine, &PlayerEngine::audioOutputReady, this, [this](const QString &deviceName) {
+        m_statusText->setToolTip(QStringLiteral("音频输出设备：%1").arg(deviceName));
+        showToast(QStringLiteral("音频输出：%1").arg(deviceName));
     });
     connect(m_engine, &PlayerEngine::positionChanged, this, [this](qint64 positionMs) {
         if (!m_progress->isSliderDown()) m_progress->setValue(int(positionMs / 1000));
@@ -459,15 +498,18 @@ void MainWindow::selectItem(int row, bool startPlayback)
 void MainWindow::playPrevious()
 {
     if (!m_playlist->count()) return;
-    if (m_progress->value() > 3) { m_engine->seek(0); m_progress->setValue(0); return; }
-    int row = m_playlist->currentRow() - 1; if (row < 0) row = m_mode == PlaybackMode::RepeatAll ? m_playlist->count() - 1 : 0; selectItem(row);
+    const auto mode = static_cast<PlaybackPolicy::PlaylistMode>(m_mode);
+    const int current = m_playlist->currentRow();
+    const int row = PlaybackPolicy::previousIndex(current, m_playlist->count(), m_engine->position(), mode);
+    if (row == current && m_engine->position() > 3000) { m_engine->seek(0); m_progress->setValue(0); return; }
+    selectItem(row);
 }
 
 void MainWindow::playNext()
 {
     if (!m_playlist->count()) return;
-    int row = m_playlist->currentRow() + 1; if (m_mode == PlaybackMode::RepeatOne) row = m_playlist->currentRow();
-    else if (row >= m_playlist->count()) { if (m_mode == PlaybackMode::Ordered) { setPlaybackState(VideoCanvas::State::Ended); return; } row = 0; }
+    const int row = PlaybackPolicy::nextIndex(m_playlist->currentRow(), m_playlist->count(), static_cast<PlaybackPolicy::PlaylistMode>(m_mode));
+    if (row < 0) { setPlaybackState(VideoCanvas::State::Ended); return; }
     selectItem(row);
 }
 
@@ -503,10 +545,22 @@ void MainWindow::toggleFullscreen()
     m_fullscreen = !m_fullscreen;
     findChild<QWidget *>(QStringLiteral("toolbar"))->setVisible(!m_fullscreen);
     findChild<QWidget *>(QStringLiteral("statusRow"))->setVisible(!m_fullscreen);
-    if (m_fullscreen) { m_playlistPanel->hide(); showFullScreen(); }
-    else { showNormal(); m_playlistPanel->setVisible(m_playlistVisible); }
+    if (m_fullscreen) {
+        m_playlistPanel->hide(); m_controls->show(); showFullScreen(); m_fullscreenControlsTimer->start();
+    } else {
+        m_fullscreenControlsTimer->stop(); m_controls->show(); showNormal(); m_playlistPanel->setVisible(m_playlistVisible);
+    }
     m_fullscreenButton->setIconType(m_fullscreen ? PlayerIcon::ExitFullscreen : PlayerIcon::Fullscreen);
     m_fullscreenButton->setToolTip(m_fullscreen ? QStringLiteral("退出全屏（F）") : QStringLiteral("进入全屏（F）"));
+}
+
+bool MainWindow::eventFilter(QObject *watched, QEvent *event)
+{
+    if (m_fullscreen && event->type() == QEvent::MouseMove) {
+        if (m_controls) { m_controls->show(); m_controls->raise(); }
+        if (m_fullscreenControlsTimer) m_fullscreenControlsTimer->start();
+    }
+    return QMainWindow::eventFilter(watched, event);
 }
 
 void MainWindow::togglePlaylist()
@@ -531,7 +585,7 @@ void MainWindow::setPlaybackState(VideoCanvas::State state, const QString &statu
     m_playButton->setIconType(m_playing ? PlayerIcon::Pause : PlayerIcon::Play);
     m_playButton->setToolTip(m_playing ? QStringLiteral("暂停（Space）") : QStringLiteral("播放（Space）"));
     const bool hasMedia = m_playlist->currentRow() >= 0;
-    m_progress->setEnabled(hasMedia && state != VideoCanvas::State::Opening && state != VideoCanvas::State::Error);
+    m_progress->setEnabled(hasMedia && m_engine->isSeekable() && state != VideoCanvas::State::Opening && state != VideoCanvas::State::Error);
     m_stopButton->setEnabled(hasMedia && state != VideoCanvas::State::Stopped && state != VideoCanvas::State::Empty && state != VideoCanvas::State::Ended);
     const bool isAudio = hasMedia && m_playlist->currentItem()->data(Qt::UserRole).toString() == QStringLiteral("audio");
     m_fullscreenButton->setEnabled(hasMedia && !isAudio && state != VideoCanvas::State::Error);
@@ -565,8 +619,8 @@ void MainWindow::updateCurrentMediaUi()
     const QString origin = network ? QStringLiteral("网络%1").arg(kind) : QStringLiteral("本地%1").arg(kind);
     m_nowTitle->setText(title); m_nowTitle->setToolTip(title); m_nowSubtitle->setText(QStringLiteral("%1 · %2").arg(origin, suffix.isEmpty() ? QStringLiteral("未知格式") : suffix));
     m_canvas->setMediaTitle(title, QStringLiteral("%1 · %2").arg(kind, suffix.isEmpty() ? QStringLiteral("未知格式") : suffix));
-    m_mediaInfo->setText(audio ? QStringLiteral("FLAC · 44.1 kHz") : QStringLiteral("1080p · H.264 · AAC"));
-    m_durationSeconds = audio ? 2536 : 3500; m_progress->setRange(0, m_durationSeconds); m_progress->setValue(0); m_progress->setBufferedValue(qRound(m_durationSeconds * 0.55)); m_totalTime->setText(formatTime(m_durationSeconds)); m_currentTime->setText(QStringLiteral("00:00"));
+    m_mediaInfo->clear();
+    m_durationSeconds = 0; m_progress->setRange(0, 0); m_progress->setValue(0); m_progress->setBufferedValue(0); m_totalTime->setText(QStringLiteral("未知")); m_currentTime->setText(QStringLiteral("00:00"));
     Q_UNUSED(info)
 }
 
