@@ -198,6 +198,7 @@ void DecoderWorker::run()
     qint64 audioQueuedUntilMs = -1;
     qint64 audioDiscardUntilMs = -1;
     qint64 videoDiscardUntilMs = -1;
+    bool emittedVideoFrame = false;
 
     auto handleFrame = [&](AVCodecContext *codec, AVStream *stream, bool audio) {
         while (!m_stop) {
@@ -243,7 +244,7 @@ void DecoderWorker::run()
                     QImage image(frame->width, frame->height, QImage::Format_ARGB32);
                     uint8_t *dst[] = {image.bits()}; int lines[] = {int(image.bytesPerLine())};
                     sws_scale(sws, frame->data, frame->linesize, 0, frame->height, dst, lines);
-                    if (audioCodec && ptsMs >= 0 && playbackClockBaseMs >= 0) {
+                    if (emittedVideoFrame && audioCodec && ptsMs >= 0 && playbackClockBaseMs >= 0) {
                         const qint64 masterClockMs = playbackClockBaseMs
                             + qRound64(playbackClock.elapsed() * m_speed.load());
                         const auto decision = PlaybackPolicy::videoDecision(ptsMs, masterClockMs);
@@ -256,6 +257,7 @@ void DecoderWorker::run()
                         if (waitMs > 0) QThread::msleep(qMin<qint64>(waitMs, 100));
                     }
                     emit videoFrameReady(image);
+                    emittedVideoFrame = true;
                 }
             }
             if (ptsMs >= 0 && qAbs(ptsMs - lastPosition) >= 50) { lastPosition = ptsMs; emit positionChanged(ptsMs); }
@@ -281,6 +283,7 @@ void DecoderWorker::run()
                 audioQueuedUntilMs = -1;
                 audioDiscardUntilMs = audioCodec ? seekMs : -1;
                 videoDiscardUntilMs = videoCodec ? seekMs : -1;
+                emittedVideoFrame = false;
                 videoBasePts = -1; videoClock.restart(); emit positionChanged(seekMs);
             }
         }
@@ -315,8 +318,14 @@ PlayerEngine::PlayerEngine(QObject *parent) : QObject(parent)
         m_audioPending.append(pcm);
         drainAudio();
     });
-    connect(m_worker, &DecoderWorker::videoFrameReady, this, &PlayerEngine::videoFrameReady);
-    connect(m_worker, &DecoderWorker::positionChanged, this, [this](qint64 position) { m_positionMs = position; emit positionChanged(position); });
+    connect(m_worker, &DecoderWorker::videoFrameReady, this, [this](const QImage &image) {
+        if (m_state != State::Paused) emit videoFrameReady(image);
+    });
+    connect(m_worker, &DecoderWorker::positionChanged, this, [this](qint64 position) {
+        if (m_state == State::Paused) return;
+        m_positionMs = position;
+        emit positionChanged(position);
+    });
     connect(m_worker, &DecoderWorker::bufferingChanged, this, [this](bool buffering, int percent) { if (buffering) setState(State::Buffering); emit bufferingChanged(buffering, percent); });
     connect(m_worker, &DecoderWorker::seekabilityChanged, this, [this](bool seekable) { m_seekable = seekable; emit seekabilityChanged(seekable); });
     connect(m_worker, &DecoderWorker::retrying, this, &PlayerEngine::retrying);

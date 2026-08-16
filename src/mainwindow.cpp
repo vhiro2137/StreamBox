@@ -474,9 +474,23 @@ void MainWindow::togglePlayback()
 {
     if (!m_playlist->count()) return;
     if (m_playlist->currentRow() < 0) m_playlist->setCurrentRow(0);
-    if (m_engine->state() == PlayerEngine::State::Paused) m_engine->play();
-    else if (m_engine->state() == PlayerEngine::State::Playing) m_engine->pause();
-    else selectItem(m_playlist->currentRow());
+    switch (m_engine->state()) {
+    case PlayerEngine::State::Playing:
+        m_engine->pause();
+        break;
+    case PlayerEngine::State::Paused:
+        m_engine->play();
+        break;
+    case PlayerEngine::State::Idle:
+    case PlayerEngine::State::Stopped:
+    case PlayerEngine::State::Ended:
+    case PlayerEngine::State::Error:
+        selectItem(m_playlist->currentRow());
+        break;
+    case PlayerEngine::State::Opening:
+    case PlayerEngine::State::Buffering:
+        break;
+    }
 }
 
 void MainWindow::stopPlayback()

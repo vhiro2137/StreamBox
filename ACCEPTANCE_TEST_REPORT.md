@@ -48,3 +48,6 @@ HEVC, VP9, AV1 and MPEG-TS remain capability-matrix extensions, not V1 core bloc
 - Delayed natural completion until the physical audio sink reaches `IdleState`, preventing truncated tails.
 - Reused the idle audio sink between natural playlist loops to stop Windows handle accumulation.
 - PCM regression verifies frame alignment, stereo sample integrity and expected 2.0× output size.
+- `danking.mp4` and `微灵医疗一面.mp4` were identified as H.264 1920×1080 + AAC. Both produced audio and video frames, rendered visible GUI screenshots, froze at 2000 ms for a 700 ms pause interval, and resumed to 2500 ms with new video frames.
+- Queued video/position signals are ignored while paused, preventing the final pre-pause event from advancing the displayed frame or progress.
+- The first decoded video frame is always displayed before late-frame policy begins, preventing initial clock skew from causing persistent audio-only playback.

@@ -34,6 +34,17 @@ $env:STREAMBOX_SCREENSHOT="$PWD\runtime-smoke.png"
   --screenshot-delay 4500 --screenshot "$PWD\fullscreen-smoke.png"
 ```
 
+The media smoke probe requires decoded output from every audio/video stream type declared by the opened media; an audio packet alone cannot make a video probe pass.
+
+For a real-device pause/resume check:
+
+```powershell
+$env:Path='D:\Qt\6.11.0\mingw_64\bin;D:\Qt_project\codex_project\third_party\ffmpeg-sdk\bin;' + $env:Path
+& '.\build\player_runtime_probe.exe' 'D:\media\sample.mp4'
+```
+
+The probe requires a video frame, pauses after 2 seconds, verifies for 700 ms that both position and displayed-frame count remain unchanged, then resumes and requires new position and video-frame output.
+
 Validated scenarios are recorded in `TECH_STACK_AUDIT.md`. Long-duration tests require representative local media and a controllable HTTP server; they are release gates rather than unit tests.
 
 ## Format matrix

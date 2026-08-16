@@ -15,10 +15,14 @@ int main(int argc, char *argv[])
 
     DecoderWorker worker;
     bool opened = false;
-    bool producedMedia = false;
+    bool expectedAudio = false;
+    bool expectedVideo = false;
+    bool producedAudio = false;
+    bool producedVideo = false;
     bool stopping = false;
     auto completeIfReady = [&] {
-        if (!opened || !producedMedia || stopping) return;
+        if (!opened || stopping) return;
+        if ((expectedAudio && !producedAudio) || (expectedVideo && !producedVideo)) return;
         stopping = true;
         worker.requestStop();
         QTimer::singleShot(0, &app, &QCoreApplication::quit);
@@ -27,6 +31,8 @@ int main(int argc, char *argv[])
     QObject::connect(&worker, &DecoderWorker::mediaOpened, &app,
         [&](qint64 duration, bool audio, bool video, const QString &description) {
             opened = audio || video;
+            expectedAudio = audio;
+            expectedVideo = video;
             const QByteArray line = QStringLiteral("opened duration=%1 audio=%2 video=%3 %4\n")
                 .arg(duration).arg(audio).arg(video).arg(description).toUtf8();
             std::fwrite(line.constData(), 1, size_t(line.size()), stdout);
@@ -34,16 +40,16 @@ int main(int argc, char *argv[])
             completeIfReady();
         });
     QObject::connect(&worker, &DecoderWorker::audioDataReady, &app, [&](const QByteArray &data) {
-        producedMedia = producedMedia || !data.isEmpty(); completeIfReady();
+        producedAudio = producedAudio || !data.isEmpty(); completeIfReady();
     });
     QObject::connect(&worker, &DecoderWorker::videoFrameReady, &app, [&](const QImage &image) {
-        producedMedia = producedMedia || !image.isNull(); completeIfReady();
+        producedVideo = producedVideo || !image.isNull(); completeIfReady();
     });
     QObject::connect(&worker, &DecoderWorker::playbackError, &app, [&](const QString &message, const QString &details) {
         qCritical().noquote() << message << details; stopping = true; app.exit(2);
     });
     QObject::connect(&worker, &DecoderWorker::playbackFinished, &app, [&] {
-        if (!opened || !producedMedia) { stopping = true; app.exit(3); }
+        if (!opened || (expectedAudio && !producedAudio) || (expectedVideo && !producedVideo)) { stopping = true; app.exit(3); }
         else { stopping = true; app.quit(); }
     });
     QTimer timeout;

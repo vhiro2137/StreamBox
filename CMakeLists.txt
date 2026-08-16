@@ -105,6 +105,20 @@ if(BUILD_TESTING)
     qt_add_executable(audio_device_test tests/audio_device_test.cpp)
     target_link_libraries(audio_device_test PRIVATE Qt6::Multimedia)
 
+    qt_add_executable(player_runtime_probe
+        tests/player_runtime_probe.cpp
+        src/player/playerengine.h
+        src/player/playerengine.cpp
+        src/player/playbackpolicy.h
+        src/player/playbackpolicy.cpp)
+    target_include_directories(player_runtime_probe PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src" "${FFMPEG_ROOT}/include")
+    target_link_libraries(player_runtime_probe PRIVATE
+        Qt6::Multimedia
+        ${FFMPEG_avformat_LIBRARY} ${FFMPEG_avcodec_LIBRARY}
+        ${FFMPEG_avfilter_LIBRARY} ${FFMPEG_swresample_LIBRARY}
+        ${FFMPEG_swscale_LIBRARY} ${FFMPEG_avutil_LIBRARY})
+
     add_executable(ffmpeg_sdk_smoke scripts/verify_ffmpeg_sdk.c)
     target_include_directories(ffmpeg_sdk_smoke PRIVATE "${FFMPEG_ROOT}/include")
     target_link_libraries(ffmpeg_sdk_smoke PRIVATE
