@@ -62,6 +62,18 @@ private slots:
         QCOMPARE(opened.count(), 1);
         QVERIFY(!audio.isEmpty());
         QVERIFY(!positions.isEmpty());
+        qint64 decodedBytes = 0;
+        for (const auto &entry : audio) {
+            const QByteArray pcm = entry.at(0).toByteArray();
+            QVERIFY(!pcm.isEmpty());
+            QCOMPARE(pcm.size() % 4, 0);
+            decodedBytes += pcm.size();
+            const auto *samples = reinterpret_cast<const qint16 *>(pcm.constData());
+            for (int i = 0; i + 1 < pcm.size() / 2; i += 2)
+                QCOMPARE(samples[i], samples[i + 1]);
+        }
+        QVERIFY(decodedBytes > 100000);
+        QVERIFY(decodedBytes < 130000);
         const auto metadata = opened.takeFirst();
         QVERIFY(metadata.at(0).toLongLong() >= 1100);
         QVERIFY(metadata.at(1).toBool());

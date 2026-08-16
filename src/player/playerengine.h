@@ -8,6 +8,7 @@
 
 class QAudioSink;
 class QIODevice;
+class QTimer;
 
 class DecoderWorker final : public QThread
 {
@@ -85,19 +86,25 @@ signals:
 
 private:
     void setState(State state);
-    void resetAudio();
+    void resetAudio(bool releaseSink = true);
     void configureAudio(int sampleRate, int channels);
+    void drainAudio();
+    void completePlayback();
     void reportAudioError(const QString &message);
 
     DecoderWorker *m_worker = nullptr;
     QAudioSink *m_audioSink = nullptr;
     QIODevice *m_audioDevice = nullptr;
+    QTimer *m_audioWriteTimer = nullptr;
+    QByteArray m_audioPending;
+    QByteArray m_audioDeviceId;
     State m_state = State::Idle;
     qint64 m_durationMs = 0;
     qint64 m_positionMs = 0;
     bool m_hasAudio = false;
     bool m_hasVideo = false;
     bool m_seekable = false;
+    bool m_finishPending = false;
     bool m_muted = false;
     float m_volume = 0.7f;
 };
