@@ -193,7 +193,9 @@ void DecoderWorker::run()
     QElapsedTimer videoClock; videoClock.start();
     qint64 videoBasePts = -1;
     qint64 lastPosition = -1;
-    qint64 audioClockMs = -1;
+    QElapsedTimer playbackClock;
+    qint64 playbackClockBaseMs = -1;
+    qint64 audioQueuedUntilMs = -1;
     qint64 audioDiscardUntilMs = -1;
     qint64 videoDiscardUntilMs = -1;
 
@@ -215,12 +217,25 @@ void DecoderWorker::run()
                     while (av_buffersink_get_frame(audioFilter.sink, filteredFrame) >= 0) {
                         const int bytes = filteredFrame->nb_samples * outputChannels * 2;
                         emit audioDataReady(QByteArray(reinterpret_cast<const char *>(filteredFrame->data[0]), bytes));
-                        const int sleepMs = qRound(1000.0 * filteredFrame->nb_samples / outputRate);
-                        if (sleepMs > 0) QThread::msleep(qMin(sleepMs, 100));
+                        const double speed = m_speed.load();
+                        const qint64 mediaDurationMs = qMax<qint64>(1,
+                            qRound64(1000.0 * filteredFrame->nb_samples * speed / outputRate));
+                        if (playbackClockBaseMs < 0) {
+                            playbackClockBaseMs = ptsMs >= 0 ? ptsMs : 0;
+                            audioQueuedUntilMs = playbackClockBaseMs;
+                            playbackClock.start();
+                        }
+                        audioQueuedUntilMs = qMax(audioQueuedUntilMs, ptsMs >= 0 ? ptsMs : audioQueuedUntilMs)
+                                           + mediaDurationMs;
+                        while (!m_stop && !m_paused) {
+                            const qint64 master = playbackClockBaseMs
+                                + qRound64(playbackClock.elapsed() * speed);
+                            if (audioQueuedUntilMs - master <= 250) break;
+                            QThread::msleep(5);
+                        }
                         av_frame_unref(filteredFrame);
                     }
                 }
-                if (ptsMs >= 0) audioClockMs = ptsMs;
             } else if (!audio) {
                 sws = sws_getCachedContext(sws, frame->width, frame->height, static_cast<AVPixelFormat>(frame->format),
                                            frame->width, frame->height, AV_PIX_FMT_BGRA, SWS_BILINEAR, nullptr, nullptr, nullptr);
@@ -228,8 +243,10 @@ void DecoderWorker::run()
                     QImage image(frame->width, frame->height, QImage::Format_ARGB32);
                     uint8_t *dst[] = {image.bits()}; int lines[] = {int(image.bytesPerLine())};
                     sws_scale(sws, frame->data, frame->linesize, 0, frame->height, dst, lines);
-                    if (audioCodec && ptsMs >= 0 && audioClockMs >= 0) {
-                        const auto decision = PlaybackPolicy::videoDecision(ptsMs, audioClockMs);
+                    if (audioCodec && ptsMs >= 0 && playbackClockBaseMs >= 0) {
+                        const qint64 masterClockMs = playbackClockBaseMs
+                            + qRound64(playbackClock.elapsed() * m_speed.load());
+                        const auto decision = PlaybackPolicy::videoDecision(ptsMs, masterClockMs);
                         if (decision.action == PlaybackPolicy::VideoAction::Drop) { av_frame_unref(frame); continue; }
                         if (decision.action == PlaybackPolicy::VideoAction::Delay) QThread::msleep(unsigned(decision.delayMs));
                     } else if (!audioCodec && ptsMs >= 0) {
@@ -247,7 +264,12 @@ void DecoderWorker::run()
     };
 
     while (!m_stop) {
-        while (m_paused && !m_stop) QThread::msleep(20);
+        if (m_paused && !m_stop) {
+            const qint64 pausedClockMs = playbackClockBaseMs >= 0
+                ? playbackClockBaseMs + qRound64(playbackClock.elapsed() * m_speed.load()) : -1;
+            while (m_paused && !m_stop) QThread::msleep(20);
+            if (pausedClockMs >= 0) { playbackClockBaseMs = pausedClockMs; playbackClock.restart(); }
+        }
         const qint64 seekMs = m_seekMs.exchange(-1);
         if (seekMs >= 0) {
             const int64_t target = av_rescale(seekMs, AV_TIME_BASE, 1000);
@@ -255,7 +277,8 @@ void DecoderWorker::run()
                 if (audioCodec) avcodec_flush_buffers(audioCodec);
                 if (videoCodec) avcodec_flush_buffers(videoCodec);
                 if (audioCodec) audioFilter.rebuild(audioCodec, m_speed.load(), decoderError);
-                audioClockMs = -1;
+                playbackClockBaseMs = -1;
+                audioQueuedUntilMs = -1;
                 audioDiscardUntilMs = audioCodec ? seekMs : -1;
                 videoDiscardUntilMs = videoCodec ? seekMs : -1;
                 videoBasePts = -1; videoClock.restart(); emit positionChanged(seekMs);
@@ -280,31 +303,44 @@ void DecoderWorker::run()
 PlayerEngine::PlayerEngine(QObject *parent) : QObject(parent)
 {
     m_worker = new DecoderWorker(this);
+    m_audioWriteTimer = new QTimer(this);
+    m_audioWriteTimer->setInterval(5);
+    connect(m_audioWriteTimer, &QTimer::timeout, this, &PlayerEngine::drainAudio);
     connect(m_worker, &DecoderWorker::mediaOpened, this, [this](qint64 duration, bool audio, bool video, const QString &description) {
         m_durationMs = duration; m_hasAudio = audio; m_hasVideo = video; emit mediaOpened(duration, audio, video, description); setState(State::Playing);
     });
     connect(m_worker, &DecoderWorker::audioFormatReady, this, &PlayerEngine::configureAudio);
     connect(m_worker, &DecoderWorker::audioDataReady, this, [this](const QByteArray &pcm) {
-        if (m_audioDevice && m_state != State::Paused) m_audioDevice->write(pcm);
+        if (!m_audioDevice) return;
+        m_audioPending.append(pcm);
+        drainAudio();
     });
     connect(m_worker, &DecoderWorker::videoFrameReady, this, &PlayerEngine::videoFrameReady);
     connect(m_worker, &DecoderWorker::positionChanged, this, [this](qint64 position) { m_positionMs = position; emit positionChanged(position); });
     connect(m_worker, &DecoderWorker::bufferingChanged, this, [this](bool buffering, int percent) { if (buffering) setState(State::Buffering); emit bufferingChanged(buffering, percent); });
     connect(m_worker, &DecoderWorker::seekabilityChanged, this, [this](bool seekable) { m_seekable = seekable; emit seekabilityChanged(seekable); });
     connect(m_worker, &DecoderWorker::retrying, this, &PlayerEngine::retrying);
-    connect(m_worker, &DecoderWorker::playbackFinished, this, [this] { resetAudio(); setState(State::Ended); emit finished(); });
+    connect(m_worker, &DecoderWorker::playbackFinished, this, [this] {
+        if (m_audioSink && (!m_audioPending.isEmpty() || m_audioSink->bytesFree() < m_audioSink->bufferSize())) {
+            m_finishPending = true;
+            return;
+        }
+        completePlayback();
+    });
     connect(m_worker, &DecoderWorker::playbackError, this, [this](const QString &message, const QString &details) { resetAudio(); setState(State::Error); emit errorOccurred(message, details); });
 }
 
-PlayerEngine::~PlayerEngine() { stop(); }
+PlayerEngine::~PlayerEngine() { stop(); resetAudio(true); }
 
 void PlayerEngine::open(const QString &source)
 {
-    stop(); m_durationMs = m_positionMs = 0; m_hasAudio = m_hasVideo = m_seekable = false; setState(State::Opening); m_worker->open(source);
+    if (m_state != State::Ended) stop();
+    else { m_finishPending = false; m_audioPending.clear(); }
+    m_durationMs = m_positionMs = 0; m_hasAudio = m_hasVideo = m_seekable = false; setState(State::Opening); m_worker->open(source);
 }
 void PlayerEngine::play() { if (m_state == State::Paused) { m_worker->requestPause(false); if (m_audioSink) m_audioSink->resume(); setState(State::Playing); } }
 void PlayerEngine::pause() { if (m_state == State::Playing) { m_worker->requestPause(true); if (m_audioSink) m_audioSink->suspend(); setState(State::Paused); } }
-void PlayerEngine::stop() { if (m_worker && m_worker->isRunning()) { m_worker->requestStop(); m_worker->wait(3000); } resetAudio(); if (m_state != State::Idle) setState(State::Stopped); }
+void PlayerEngine::stop() { if (m_worker && m_worker->isRunning()) { m_worker->requestStop(); m_worker->wait(3000); } resetAudio(false); if (m_state != State::Idle) setState(State::Stopped); }
 void PlayerEngine::seek(qint64 milliseconds)
 {
     if (!m_seekable || !m_worker->isRunning()) return;
@@ -316,19 +352,42 @@ void PlayerEngine::setMuted(bool muted) { m_muted = muted; if (m_audioSink) m_au
 void PlayerEngine::setSpeed(double speed) { m_worker->setSpeed(speed); }
 void PlayerEngine::setState(State state) { if (m_state != state) { m_state = state; emit stateChanged(state); } }
 
-void PlayerEngine::resetAudio()
+void PlayerEngine::resetAudio(bool releaseSink)
 {
-    if (m_audioSink) { m_audioSink->stop(); delete m_audioSink; m_audioSink = nullptr; m_audioDevice = nullptr; }
+    m_finishPending = false;
+    if (m_audioWriteTimer) m_audioWriteTimer->stop();
+    m_audioPending.clear();
+    if (m_audioSink) {
+        m_audioSink->stop();
+        m_audioDevice = nullptr;
+        if (releaseSink) { delete m_audioSink; m_audioSink = nullptr; m_audioDeviceId.clear(); }
+    }
 }
 
 void PlayerEngine::configureAudio(int sampleRate, int channels)
 {
-    resetAudio(); QAudioFormat format; format.setSampleRate(sampleRate); format.setChannelCount(channels); format.setSampleFormat(QAudioFormat::Int16);
+    QAudioFormat format; format.setSampleRate(sampleRate); format.setChannelCount(channels); format.setSampleFormat(QAudioFormat::Int16);
     QAudioDevice device = QMediaDevices::defaultAudioOutput();
     if (device.isNull()) { reportAudioError(QStringLiteral("未检测到可用的音频输出设备")); return; }
     if (!device.isFormatSupported(format)) { reportAudioError(QStringLiteral("默认音频设备不支持 48 kHz 双声道 S16 输出")); return; }
+    if (m_audioSink && m_audioSink->format() == format && m_audioDeviceId == device.id()) {
+        m_audioSink->setVolume(m_muted ? 0.0f : m_volume);
+        if (!m_audioDevice) m_audioDevice = m_audioSink->start();
+        if (!m_audioDevice) { reportAudioError(QStringLiteral("无法继续使用默认音频输出设备")); return; }
+        m_audioWriteTimer->start();
+        emit audioOutputReady(device.description());
+        return;
+    }
+    resetAudio(true);
     m_audioSink = new QAudioSink(device, format, this); m_audioSink->setBufferSize(sampleRate * channels * 2 / 2);
+    m_audioDeviceId = device.id();
     connect(m_audioSink, &QAudioSink::stateChanged, this, [this](QtAudio::State state) {
+        if (state == QtAudio::IdleState && m_finishPending && m_audioPending.isEmpty()) {
+            QTimer::singleShot(0, this, [this] {
+                if (m_finishPending && m_audioPending.isEmpty()) completePlayback();
+            });
+            return;
+        }
         if (state == QtAudio::StoppedState && m_audioSink && m_audioSink->error() != QtAudio::NoError) {
             const int errorCode = int(m_audioSink->error());
             QTimer::singleShot(0, this, [this, errorCode] {
@@ -339,10 +398,36 @@ void PlayerEngine::configureAudio(int sampleRate, int channels)
     });
     m_audioSink->setVolume(m_muted ? 0.0f : m_volume); m_audioDevice = m_audioSink->start();
     if (!m_audioDevice) { reportAudioError(QStringLiteral("无法启动默认音频输出设备")); return; }
+    m_audioWriteTimer->start();
     emit audioOutputReady(device.description());
+}
+
+void PlayerEngine::drainAudio()
+{
+    if (!m_audioSink || !m_audioDevice || m_state == State::Paused) return;
+    while (!m_audioPending.isEmpty()) {
+        const qint64 available = m_audioSink->bytesFree();
+        if (available <= 0) break;
+        const qint64 requested = qMin<qint64>(available, m_audioPending.size());
+        const qint64 written = m_audioDevice->write(m_audioPending.constData(), requested);
+        if (written <= 0) break;
+        m_audioPending.remove(0, qsizetype(written));
+    }
+    if (m_finishPending && m_audioPending.isEmpty()
+        && m_audioSink->bytesFree() >= m_audioSink->bufferSize())
+        completePlayback();
+}
+
+void PlayerEngine::completePlayback()
+{
+    m_finishPending = false;
+    m_audioPending.clear();
+    if (m_audioWriteTimer) m_audioWriteTimer->stop();
+    setState(State::Ended);
+    emit finished();
 }
 
 void PlayerEngine::reportAudioError(const QString &message)
 {
-    resetAudio(); setState(State::Error); emit errorOccurred(message, QStringLiteral("请检查 Windows 默认输出设备、音量和独占模式设置。"));
+    resetAudio(true); setState(State::Error); emit errorOccurred(message, QStringLiteral("请检查 Windows 默认输出设备、音量和独占模式设置。"));
 }

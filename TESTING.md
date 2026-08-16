@@ -61,3 +61,5 @@ $env:Path='D:\Qt\6.11.0\mingw_64\bin;' + $env:Path
 ```
 
 This plays an audible three-second intermittent 1 kHz tone through Qt's current default output and verifies at least 2.5 seconds of `QAudioSink` hardware time with no sink error. Human confirmation is still required to prove that the selected physical endpoint is connected and audible.
+
+The decoder integration test also verifies that filtered PCM remains frame-aligned, that generated identical stereo channels remain identical, and that 2.0× output has the expected byte count. These checks detect planar/packed mistakes and truncated audio that a non-empty-output assertion would miss.

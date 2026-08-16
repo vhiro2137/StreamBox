@@ -3,6 +3,7 @@
 #include <QCoreApplication>
 #include <QDebug>
 #include <QTimer>
+#include <cstdio>
 
 int main(int argc, char *argv[])
 {
@@ -26,8 +27,10 @@ int main(int argc, char *argv[])
     QObject::connect(&worker, &DecoderWorker::mediaOpened, &app,
         [&](qint64 duration, bool audio, bool video, const QString &description) {
             opened = audio || video;
-            qInfo().noquote() << QStringLiteral("opened duration=%1 audio=%2 video=%3 %4")
-                .arg(duration).arg(audio).arg(video).arg(description);
+            const QByteArray line = QStringLiteral("opened duration=%1 audio=%2 video=%3 %4\n")
+                .arg(duration).arg(audio).arg(video).arg(description).toUtf8();
+            std::fwrite(line.constData(), 1, size_t(line.size()), stdout);
+            std::fflush(stdout);
             completeIfReady();
         });
     QObject::connect(&worker, &DecoderWorker::audioDataReady, &app, [&](const QByteArray &data) {

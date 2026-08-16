@@ -3,7 +3,9 @@ param(
     [string]$Media,
     [double]$DurationMinutes = 120,
     [int]$SampleIntervalSeconds = 10,
-    [int]$MaximumGrowthMB = 256
+    [int]$MaximumGrowthMB = 256,
+    [int]$MaximumHandleGrowth = 64,
+    [int]$WarmupSeconds = 10
 )
 
 $ErrorActionPreference = 'Stop'
@@ -43,9 +45,17 @@ try {
 
 if ($process.ExitCode -ne 0) { throw "StreamBox exited with code $($process.ExitCode)" }
 if ($samples.Count -gt 1) {
-    $growth = $samples[$samples.Count - 1].WorkingSetMB - $samples[0].WorkingSetMB
+    $warmupSamples = [Math]::Min($samples.Count - 1,
+        [Math]::Max(1, [Math]::Ceiling($WarmupSeconds / $SampleIntervalSeconds)))
+    $baseline = $samples[$warmupSamples]
+    $last = $samples[$samples.Count - 1]
+    $growth = $last.WorkingSetMB - $baseline.WorkingSetMB
     if ($growth -gt $MaximumGrowthMB) {
         throw "Working set grew by $growth MB, exceeding $MaximumGrowthMB MB"
+    }
+    $handleGrowth = $last.Handles - $baseline.Handles
+    if ($handleGrowth -gt $MaximumHandleGrowth) {
+        throw "Handle count grew by $handleGrowth, exceeding $MaximumHandleGrowth"
     }
 }
 
