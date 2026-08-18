@@ -159,7 +159,7 @@ VideoCanvas::VideoCanvas(QWidget *parent) : QFrame(parent)
 {
     setObjectName(QStringLiteral("videoCanvas"));
     setAcceptDrops(true);
-    setFocusPolicy(Qt::StrongFocus);
+    setFocusPolicy(Qt::NoFocus);
     setCursor(Qt::ArrowCursor);
     setMinimumSize(500, 300);
 }

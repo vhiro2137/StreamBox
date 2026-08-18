@@ -1,6 +1,7 @@
 #include "mainwindow.h"
 #include "player/playerengine.h"
 #include "player/playbackpolicy.h"
+#include "network/networkpolicy.h"
 
 #include <QActionGroup>
 #include <QApplication>
@@ -64,8 +65,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
 
 void MainWindow::openMedia(const QString &source)
 {
-    const QUrl url(source);
-    if ((url.scheme() == QStringLiteral("http") || url.scheme() == QStringLiteral("https")) && url.isValid()) {
+    const QUrl url(source, QUrl::StrictMode);
+    if (NetworkPolicy::validateMediaUrl(source).accepted) {
         auto *item = new QListWidgetItem(QStringLiteral("%1\n%2 · 网络媒体").arg(QFileInfo(url.path()).fileName(), url.host()));
         item->setData(Qt::UserRole, QStringLiteral("video")); item->setData(Qt::UserRole + 1, QFileInfo(url.path()).completeBaseName());
         item->setData(Qt::UserRole + 2, url.host()); item->setData(Qt::UserRole + 3, url.toString()); m_playlist->addItem(item);
@@ -78,6 +79,7 @@ void MainWindow::setPlaybackSpeed(double speed)
     const double bounded = qBound(0.5, speed, 2.0);
     m_engine->setSpeed(bounded);
     m_speedButton->setText(QString::number(bounded, 'f', bounded == qRound(bounded) ? 1 : 2) + QStringLiteral("×"));
+    m_speedButton->setAccessibleName(QStringLiteral("播放速度 %1 倍").arg(QString::number(bounded, 'f', 2)));
 }
 
 void MainWindow::seekTo(qint64 milliseconds)
@@ -158,18 +160,24 @@ QWidget *MainWindow::createToolbar()
     fileButton->setObjectName(QStringLiteral("openFileButton"));
     fileButton->setFixedSize(96, 32);
     fileButton->setToolTip(QStringLiteral("打开文件（Ctrl+O）"));
+    fileButton->setAccessibleName(QStringLiteral("打开文件"));
+    fileButton->setAccessibleDescription(QStringLiteral("选择本地音频或视频文件，快捷键 Ctrl+O"));
     auto *urlButton = makeTextButton(QStringLiteral("  打开 URL"), "secondary", bar);
     urlButton->setObjectName(QStringLiteral("openUrlButton"));
     urlButton->setFixedSize(96, 32);
     urlButton->setToolTip(QStringLiteral("打开 URL（Ctrl+U）"));
+    urlButton->setAccessibleName(QStringLiteral("打开网络媒体"));
+    urlButton->setAccessibleDescription(QStringLiteral("输入 HTTP 或 HTTPS 媒体地址，快捷键 Ctrl+U"));
     layout->addWidget(fileButton);
     layout->addWidget(urlButton);
     layout->addStretch();
 
     m_listButton = new IconButton(PlayerIcon::List, bar);
     m_listButton->setToolTip(QStringLiteral("收起播放列表"));
+    m_listButton->setAccessibleName(QStringLiteral("收起播放列表"));
     auto *more = new IconButton(PlayerIcon::More, bar);
     more->setToolTip(QStringLiteral("更多设置"));
+    more->setAccessibleName(QStringLiteral("更多设置"));
     more->setObjectName(QStringLiteral("moreButton"));
     layout->addWidget(m_listButton);
     layout->addWidget(more);
@@ -196,9 +204,11 @@ QWidget *MainWindow::createPlaylistPanel()
     auto *add = makeTextButton(QStringLiteral("添加"), "flat", header);
     add->setObjectName(QStringLiteral("addMediaButton"));
     add->setFixedWidth(54);
+    add->setAccessibleName(QStringLiteral("添加媒体"));
     auto *more = new IconButton(PlayerIcon::More, header);
     more->setObjectName(QStringLiteral("playlistMoreButton"));
     more->setToolTip(QStringLiteral("播放列表更多操作"));
+    more->setAccessibleName(QStringLiteral("播放列表更多操作"));
     headLayout->addWidget(title);
     headLayout->addWidget(m_playlistCount);
     headLayout->addStretch();
@@ -207,6 +217,8 @@ QWidget *MainWindow::createPlaylistPanel()
     layout->addWidget(header);
 
     m_playlist = new QListWidget(panel);
+    m_playlist->setAccessibleName(QStringLiteral("播放列表"));
+    m_playlist->setAccessibleDescription(QStringLiteral("使用方向键选择媒体，按回车或双击播放"));
     m_playlist->setSelectionMode(QAbstractItemView::SingleSelection);
     m_playlist->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
     m_playlist->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -232,6 +244,8 @@ QWidget *MainWindow::createControls()
     m_currentTime = makeLabel(QStringLiteral("00:00"), {}, progressRow);
     m_currentTime->setFixedWidth(52); m_currentTime->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     m_progress = new ProgressSlider(Qt::Horizontal, progressRow);
+    m_progress->setAccessibleName(QStringLiteral("播放进度"));
+    m_progress->setAccessibleDescription(QStringLiteral("使用左右方向键调整播放位置"));
     m_progress->setEnabled(false); m_progress->setBufferedValue(550);
     m_totalTime = makeLabel(QStringLiteral("00:00"), {}, progressRow);
     m_totalTime->setFixedWidth(52);
@@ -263,20 +277,20 @@ QWidget *MainWindow::createControls()
     transport->setFixedWidth(260);
     auto *transportLayout = new QHBoxLayout(transport);
     transportLayout->setContentsMargins(0, 0, 0, 0); transportLayout->setSpacing(8); transportLayout->setAlignment(Qt::AlignCenter);
-    auto *previous = new IconButton(PlayerIcon::Previous, transport); previous->setObjectName(QStringLiteral("previousButton")); previous->setFixedSize(36, 36); previous->setToolTip(QStringLiteral("上一首（P）"));
-    m_playButton = new IconButton(PlayerIcon::Play, transport); m_playButton->setObjectName(QStringLiteral("playMain")); m_playButton->setProperty("accentIcon", true); m_playButton->setProperty("largeIcon", true); m_playButton->setFixedSize(44, 44); m_playButton->setToolTip(QStringLiteral("播放（Space）"));
-    auto *next = new IconButton(PlayerIcon::Next, transport); next->setObjectName(QStringLiteral("nextButton")); next->setFixedSize(36, 36); next->setToolTip(QStringLiteral("下一首（N）"));
-    m_stopButton = new IconButton(PlayerIcon::Stop, transport); m_stopButton->setFixedSize(36, 36); m_stopButton->setToolTip(QStringLiteral("停止")); m_stopButton->setEnabled(false);
+    auto *previous = new IconButton(PlayerIcon::Previous, transport); previous->setObjectName(QStringLiteral("previousButton")); previous->setFixedSize(36, 36); previous->setToolTip(QStringLiteral("上一首（P）")); previous->setAccessibleName(QStringLiteral("上一首")); previous->setAccessibleDescription(QStringLiteral("播放上一个媒体，快捷键 P"));
+    m_playButton = new IconButton(PlayerIcon::Play, transport); m_playButton->setObjectName(QStringLiteral("playMain")); m_playButton->setProperty("accentIcon", true); m_playButton->setProperty("largeIcon", true); m_playButton->setFixedSize(44, 44); m_playButton->setToolTip(QStringLiteral("播放（Space）")); m_playButton->setAccessibleName(QStringLiteral("播放")); m_playButton->setAccessibleDescription(QStringLiteral("播放当前媒体，快捷键空格"));
+    auto *next = new IconButton(PlayerIcon::Next, transport); next->setObjectName(QStringLiteral("nextButton")); next->setFixedSize(36, 36); next->setToolTip(QStringLiteral("下一首（N）")); next->setAccessibleName(QStringLiteral("下一首")); next->setAccessibleDescription(QStringLiteral("播放下一个媒体，快捷键 N"));
+    m_stopButton = new IconButton(PlayerIcon::Stop, transport); m_stopButton->setFixedSize(36, 36); m_stopButton->setToolTip(QStringLiteral("停止")); m_stopButton->setAccessibleName(QStringLiteral("停止")); m_stopButton->setAccessibleDescription(QStringLiteral("停止播放并将进度重置到起点")); m_stopButton->setEnabled(false);
     transportLayout->addWidget(previous); transportLayout->addWidget(m_playButton); transportLayout->addWidget(next); transportLayout->addWidget(m_stopButton);
     mainLayout->addWidget(transport);
 
     auto *tools = new QWidget(mainRow);
     auto *toolsLayout = new QHBoxLayout(tools); toolsLayout->setContentsMargins(0, 0, 0, 0); toolsLayout->setSpacing(4); toolsLayout->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    m_speedButton = makeTextButton(QStringLiteral("1.0×"), "flat", tools); m_speedButton->setFixedSize(56, 32); m_speedButton->setToolTip(QStringLiteral("播放速度"));
-    m_modeButton = new IconButton(PlayerIcon::Repeat, tools); m_modeButton->setToolTip(QStringLiteral("列表循环"));
-    m_muteButton = new IconButton(PlayerIcon::Volume, tools); m_muteButton->setToolTip(QStringLiteral("静音（M）"));
-    m_volume = new QSlider(Qt::Horizontal, tools); m_volume->setObjectName(QStringLiteral("volume")); m_volume->setRange(0, 100); m_volume->setValue(70); m_volume->setFixedSize(88, 20); m_volume->setToolTip(QStringLiteral("音量 70%"));
-    m_fullscreenButton = new IconButton(PlayerIcon::Fullscreen, tools); m_fullscreenButton->setToolTip(QStringLiteral("进入全屏（F）")); m_fullscreenButton->setEnabled(false);
+    m_speedButton = makeTextButton(QStringLiteral("1.0×"), "flat", tools); m_speedButton->setObjectName(QStringLiteral("speedButton")); m_speedButton->setFixedSize(56, 32); m_speedButton->setToolTip(QStringLiteral("播放速度")); m_speedButton->setAccessibleName(QStringLiteral("播放速度 1.0 倍"));
+    m_modeButton = new IconButton(PlayerIcon::Repeat, tools); m_modeButton->setToolTip(QStringLiteral("列表循环")); m_modeButton->setAccessibleName(QStringLiteral("播放模式：列表循环"));
+    m_muteButton = new IconButton(PlayerIcon::Volume, tools); m_muteButton->setToolTip(QStringLiteral("静音（M）")); m_muteButton->setAccessibleName(QStringLiteral("静音")); m_muteButton->setAccessibleDescription(QStringLiteral("切换静音状态，快捷键 M"));
+    m_volume = new QSlider(Qt::Horizontal, tools); m_volume->setObjectName(QStringLiteral("volume")); m_volume->setRange(0, 100); m_volume->setValue(70); m_volume->setFixedSize(88, 20); m_volume->setToolTip(QStringLiteral("音量 70%")); m_volume->setAccessibleName(QStringLiteral("音量")); m_volume->setAccessibleDescription(QStringLiteral("当前音量 70%，使用上下方向键调整"));
+    m_fullscreenButton = new IconButton(PlayerIcon::Fullscreen, tools); m_fullscreenButton->setToolTip(QStringLiteral("进入全屏（F）")); m_fullscreenButton->setAccessibleName(QStringLiteral("进入全屏")); m_fullscreenButton->setAccessibleDescription(QStringLiteral("切换视频全屏，快捷键 F")); m_fullscreenButton->setEnabled(false);
     toolsLayout->addWidget(m_speedButton); toolsLayout->addWidget(m_modeButton); toolsLayout->addWidget(m_muteButton); toolsLayout->addWidget(m_volume); toolsLayout->addWidget(m_fullscreenButton);
     mainLayout->addWidget(tools, 1);
     root->addWidget(mainRow);
@@ -349,14 +363,21 @@ void MainWindow::connectActions()
     });
     connect(m_volume, &QSlider::valueChanged, this, [this](int value) {
         m_volume->setToolTip(QStringLiteral("音量 %1%").arg(value));
+        m_volume->setAccessibleDescription(QStringLiteral("当前音量 %1%，使用上下方向键调整").arg(value));
         m_engine->setVolume(value / 100.0f);
-        if (value > 0 && m_muted) { m_muted = false; m_muteButton->setIconType(PlayerIcon::Volume); }
+        if (value > 0 && m_muted) {
+            m_muted = false; m_muteButton->setIconType(PlayerIcon::Volume);
+            m_muteButton->setAccessibleName(QStringLiteral("静音"));
+        }
     });
     connect(m_toastTimer, &QTimer::timeout, m_toast, &QWidget::hide);
     connect(m_engine, &PlayerEngine::videoFrameReady, m_canvas, &VideoCanvas::setVideoFrame);
     connect(m_engine, &PlayerEngine::mediaOpened, this, [this](qint64 durationMs, bool, bool video, const QString &description) {
         m_durationSeconds = int(durationMs / 1000); m_progress->setRange(0, qMax(0, m_durationSeconds));
         m_totalTime->setText(durationMs > 0 ? formatTime(m_durationSeconds) : QStringLiteral("未知"));
+        m_progress->setAccessibleDescription(durationMs > 0
+            ? QStringLiteral("播放进度，总时长 %1，使用左右方向键调整").arg(formatTime(m_durationSeconds))
+            : QStringLiteral("播放进度，总时长未知"));
         m_mediaInfo->setText(description); m_fullscreenButton->setEnabled(video);
     });
     connect(m_engine, &PlayerEngine::seekabilityChanged, this, [this](bool seekable) {
@@ -456,9 +477,11 @@ void MainWindow::openUrlDialog()
     connect(input, &QLineEdit::textChanged, open, [open](const QString &text) { open->setEnabled(!text.trimmed().isEmpty()); });
     connect(cancel, &QPushButton::clicked, &dialog, &QDialog::reject);
     connect(open, &QPushButton::clicked, &dialog, [&] {
-        const QUrl url(input->text().trimmed());
-        if (!url.isValid() || (url.scheme().compare("http", Qt::CaseInsensitive) && url.scheme().compare("https", Qt::CaseInsensitive))) {
-            validation->setText(QStringLiteral("请输入有效的 HTTP 或 HTTPS 地址")); input->setProperty("error", true); input->style()->unpolish(input); input->style()->polish(input); input->setFocus(); return;
+        const QString source = input->text().trimmed();
+        const auto result = NetworkPolicy::validateMediaUrl(source);
+        const QUrl url(source, QUrl::StrictMode);
+        if (!result.accepted) {
+            validation->setText(result.error); input->setProperty("error", true); input->style()->unpolish(input); input->style()->polish(input); input->setFocus(); return;
         }
         auto *item = new QListWidgetItem(QStringLiteral("%1\n%2 · 网络媒体").arg(QFileInfo(url.path()).fileName().isEmpty() ? url.host() : QFileInfo(url.path()).fileName(), url.host()));
         item->setData(Qt::UserRole, QStringLiteral("video")); item->setData(Qt::UserRole + 1, QFileInfo(url.path()).completeBaseName().isEmpty() ? url.host() : QFileInfo(url.path()).completeBaseName()); item->setData(Qt::UserRole + 2, url.host()); item->setData(Qt::UserRole + 3, url.toString());
@@ -542,6 +565,7 @@ void MainWindow::showModeMenu()
     for (const auto &entry : modes) { QAction *a = menu.addAction(entry.first); a->setData(int(entry.second)); a->setCheckable(true); a->setChecked(entry.second == m_mode); group.addAction(a); }
     if (QAction *chosen = menu.exec(m_modeButton->mapToGlobal(QPoint(-72, -menu.sizeHint().height())))) {
         m_mode = PlaybackMode(chosen->data().toInt()); m_modeButton->setToolTip(chosen->text());
+        m_modeButton->setAccessibleName(QStringLiteral("播放模式：%1").arg(chosen->text()));
         m_modeButton->setIconType(m_mode == PlaybackMode::Ordered ? PlayerIcon::Ordered : m_mode == PlaybackMode::RepeatOne ? PlayerIcon::RepeatOne : PlayerIcon::Repeat);
         showToast(QStringLiteral("已切换为%1").arg(chosen->text()));
     }
@@ -549,8 +573,8 @@ void MainWindow::showModeMenu()
 
 void MainWindow::toggleMute()
 {
-    if (!m_muted) { m_volumeBeforeMute = m_volume->value(); m_muted = true; m_engine->setMuted(true); m_muteButton->setIconType(PlayerIcon::Muted); showToast(QStringLiteral("已静音")); }
-    else { m_muted = false; m_volume->setValue(qMax(1, m_volumeBeforeMute)); m_engine->setMuted(false); m_muteButton->setIconType(PlayerIcon::Volume); showToast(QStringLiteral("已恢复音量")); }
+    if (!m_muted) { m_volumeBeforeMute = m_volume->value(); m_muted = true; m_engine->setMuted(true); m_muteButton->setIconType(PlayerIcon::Muted); m_muteButton->setAccessibleName(QStringLiteral("取消静音")); showToast(QStringLiteral("已静音")); }
+    else { m_muted = false; m_volume->setValue(qMax(1, m_volumeBeforeMute)); m_engine->setMuted(false); m_muteButton->setIconType(PlayerIcon::Volume); m_muteButton->setAccessibleName(QStringLiteral("静音")); showToast(QStringLiteral("已恢复音量")); }
 }
 
 void MainWindow::toggleFullscreen()
@@ -566,6 +590,7 @@ void MainWindow::toggleFullscreen()
     }
     m_fullscreenButton->setIconType(m_fullscreen ? PlayerIcon::ExitFullscreen : PlayerIcon::Fullscreen);
     m_fullscreenButton->setToolTip(m_fullscreen ? QStringLiteral("退出全屏（F）") : QStringLiteral("进入全屏（F）"));
+    m_fullscreenButton->setAccessibleName(m_fullscreen ? QStringLiteral("退出全屏") : QStringLiteral("进入全屏"));
 }
 
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
@@ -598,6 +623,10 @@ void MainWindow::setPlaybackState(VideoCanvas::State state, const QString &statu
     m_playing = state == VideoCanvas::State::Playing || state == VideoCanvas::State::Audio;
     m_playButton->setIconType(m_playing ? PlayerIcon::Pause : PlayerIcon::Play);
     m_playButton->setToolTip(m_playing ? QStringLiteral("暂停（Space）") : QStringLiteral("播放（Space）"));
+    m_playButton->setAccessibleName(m_playing ? QStringLiteral("暂停") : QStringLiteral("播放"));
+    m_playButton->setAccessibleDescription(m_playing
+        ? QStringLiteral("暂停并保留当前进度，快捷键空格")
+        : QStringLiteral("从当前位置继续播放，快捷键空格"));
     const bool hasMedia = m_playlist->currentRow() >= 0;
     m_progress->setEnabled(hasMedia && m_engine->isSeekable() && state != VideoCanvas::State::Opening && state != VideoCanvas::State::Error);
     m_stopButton->setEnabled(hasMedia && state != VideoCanvas::State::Stopped && state != VideoCanvas::State::Empty && state != VideoCanvas::State::Ended);

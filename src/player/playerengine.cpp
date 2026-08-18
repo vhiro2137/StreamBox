@@ -1,12 +1,15 @@
 #include "playerengine.h"
 #include "playbackpolicy.h"
+#include "network/networkpolicy.h"
 
 #include <QAudioDevice>
 #include <QAudioSink>
+#include <QDir>
 #include <QElapsedTimer>
 #include <QMediaDevices>
 #include <QMutex>
 #include <QTimer>
+#include <QUrl>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -113,6 +116,13 @@ void DecoderWorker::run()
     avformat_network_init();
     const bool network = m_source.startsWith(QStringLiteral("http://"), Qt::CaseInsensitive)
                       || m_source.startsWith(QStringLiteral("https://"), Qt::CaseInsensitive);
+    const bool https = m_source.startsWith(QStringLiteral("https://"), Qt::CaseInsensitive);
+    const QUrl parsedSource(m_source, QUrl::StrictMode);
+    if (!network && !parsedSource.scheme().isEmpty() && !QDir::isAbsolutePath(m_source)) {
+        emit playbackError(QStringLiteral("不支持的媒体协议"), QStringLiteral("仅允许本地文件、HTTP 和 HTTPS 媒体"));
+        avformat_network_deinit();
+        return;
+    }
     const QByteArray source = m_source.toUtf8();
     AVFormatContext *format = nullptr;
     int result = AVERROR_UNKNOWN;
@@ -123,13 +133,7 @@ void DecoderWorker::run()
         format->interrupt_callback = {interruptCallback, &m_stop};
         AVDictionary *options = nullptr;
         if (network) {
-            av_dict_set(&options, "timeout", "3000000", 0);
-            av_dict_set(&options, "rw_timeout", "3000000", 0);
-            av_dict_set(&options, "reconnect", "1", 0);
-            av_dict_set(&options, "reconnect_streamed", "1", 0);
-            av_dict_set(&options, "reconnect_on_network_error", "1", 0);
-            av_dict_set(&options, "reconnect_max_retries", "0", 0);
-            av_dict_set(&options, "reconnect_delay_max", "4", 0);
+            NetworkPolicy::applyFfmpegInputOptions(&options, https);
             emit bufferingChanged(true, attempt == 0 ? 0 : -1);
         }
         result = avformat_open_input(&format, source.constData(), nullptr, &options);
@@ -150,6 +154,9 @@ void DecoderWorker::run()
         return;
     }
     if (network && format->pb) {
+        av_opt_set_int(format->pb, "reconnect", 1, AV_OPT_SEARCH_CHILDREN);
+        av_opt_set_int(format->pb, "reconnect_streamed", 0, AV_OPT_SEARCH_CHILDREN);
+        av_opt_set_int(format->pb, "reconnect_on_network_error", 1, AV_OPT_SEARCH_CHILDREN);
         av_opt_set_int(format->pb, "reconnect_max_retries", 3, AV_OPT_SEARCH_CHILDREN);
         av_opt_set_int(format->pb, "reconnect_delay_total_max", 7, AV_OPT_SEARCH_CHILDREN);
         av_opt_set_int(format->pb, "reconnect_delay_max", 4, AV_OPT_SEARCH_CHILDREN);
@@ -199,6 +206,7 @@ void DecoderWorker::run()
     qint64 audioDiscardUntilMs = -1;
     qint64 videoDiscardUntilMs = -1;
     bool emittedVideoFrame = false;
+    bool recoveringFromCorruptPacket = false;
 
     auto handleFrame = [&](AVCodecContext *codec, AVStream *stream, bool audio) {
         while (!m_stop) {
@@ -289,6 +297,16 @@ void DecoderWorker::run()
         }
         result = av_read_frame(format, packet);
         if (result < 0) break;
+        if (packet->flags & AV_PKT_FLAG_CORRUPT) {
+            if (!recoveringFromCorruptPacket) emit bufferingChanged(true, -1);
+            recoveringFromCorruptPacket = true;
+            av_packet_unref(packet);
+            continue;
+        }
+        if (recoveringFromCorruptPacket) {
+            recoveringFromCorruptPacket = false;
+            emit bufferingChanged(false, 100);
+        }
         if (packet->stream_index == audioIndex && audioCodec) {
             if (avcodec_send_packet(audioCodec, packet) >= 0) handleFrame(audioCodec, format->streams[audioIndex], true);
         } else if (packet->stream_index == videoIndex && videoCodec) {
@@ -297,10 +315,14 @@ void DecoderWorker::run()
         av_packet_unref(packet);
     }
 
+    const bool transportReachedEof = format->pb && format->pb->eof_reached;
+    const bool readFailed = result < 0 && result != AVERROR_EOF && !transportReachedEof && !m_stop;
+    const QString readError = readFailed ? ffmpegError(result) : QString();
     av_packet_free(&packet); av_frame_free(&frame); av_frame_free(&filteredFrame); sws_freeContext(sws);
     avcodec_free_context(&audioCodec); avcodec_free_context(&videoCodec); avformat_close_input(&format);
     avformat_network_deinit();
-    if (!m_stop) emit playbackFinished();
+    if (readFailed) emit playbackError(network ? QStringLiteral("网络媒体读取中断") : QStringLiteral("媒体读取失败"), readError);
+    else if (!m_stop) emit playbackFinished();
 }
 
 PlayerEngine::PlayerEngine(QObject *parent) : QObject(parent)
@@ -326,7 +348,11 @@ PlayerEngine::PlayerEngine(QObject *parent) : QObject(parent)
         m_positionMs = position;
         emit positionChanged(position);
     });
-    connect(m_worker, &DecoderWorker::bufferingChanged, this, [this](bool buffering, int percent) { if (buffering) setState(State::Buffering); emit bufferingChanged(buffering, percent); });
+    connect(m_worker, &DecoderWorker::bufferingChanged, this, [this](bool buffering, int percent) {
+        if (buffering) setState(State::Buffering);
+        else if (m_state == State::Buffering && (m_hasAudio || m_hasVideo)) setState(State::Playing);
+        emit bufferingChanged(buffering, percent);
+    });
     connect(m_worker, &DecoderWorker::seekabilityChanged, this, [this](bool seekable) { m_seekable = seekable; emit seekabilityChanged(seekable); });
     connect(m_worker, &DecoderWorker::retrying, this, &PlayerEngine::retrying);
     connect(m_worker, &DecoderWorker::playbackFinished, this, [this] {
