@@ -165,6 +165,38 @@ private slots:
         QCOMPARE(errors.count(), 0);
     }
 
+    void rejectsUnsupportedProtocol()
+    {
+        DecoderWorker worker;
+        QSignalSpy errors(&worker, &DecoderWorker::playbackError);
+        worker.open(QStringLiteral("ftp://example.com/media.mp4"));
+        QTRY_COMPARE_WITH_TIMEOUT(errors.count(), 1, 1000);
+        QCOMPARE(errors.first().at(0).toString(), QStringLiteral("不支持的媒体协议"));
+        QVERIFY(worker.wait(1000));
+    }
+
+    void rejectsRedirectToUnsupportedProtocol()
+    {
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        connect(&server, &QTcpServer::newConnection, &server, [&server] {
+            while (QTcpSocket *socket = server.nextPendingConnection()) {
+                socket->write("HTTP/1.1 302 Found\r\nLocation: ftp://example.com/media.mp4\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                socket->flush();
+                socket->waitForBytesWritten(1000);
+                socket->disconnectFromHost();
+            }
+        });
+
+        DecoderWorker worker;
+        QSignalSpy opened(&worker, &DecoderWorker::mediaOpened);
+        QSignalSpy errors(&worker, &DecoderWorker::playbackError);
+        worker.open(QStringLiteral("http://127.0.0.1:%1/redirect").arg(server.serverPort()));
+        QTRY_COMPARE_WITH_TIMEOUT(errors.count(), 1, 15000);
+        QCOMPARE(opened.count(), 0);
+        QVERIFY(worker.wait(1000));
+    }
+
     void switchMedia100Times()
     {
         QTemporaryDir directory;

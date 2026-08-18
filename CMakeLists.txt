@@ -30,9 +30,11 @@ qt_add_executable(StreamBox
     src/player/playerengine.cpp
     src/player/playbackpolicy.h
     src/player/playbackpolicy.cpp
+    src/network/networkpolicy.h
+    src/network/networkpolicy.cpp
 )
 
-target_include_directories(StreamBox PRIVATE "${FFMPEG_ROOT}/include")
+target_include_directories(StreamBox PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${FFMPEG_ROOT}/include")
 target_link_libraries(StreamBox PRIVATE
     Qt6::Widgets Qt6::Multimedia
     ${FFMPEG_avformat_LIBRARY}
@@ -75,6 +77,7 @@ if(BUILD_TESTING)
         src/player/playerengine.cpp
         src/player/playbackpolicy.h
         src/player/playbackpolicy.cpp)
+    target_sources(decoderworker_test PRIVATE src/network/networkpolicy.h src/network/networkpolicy.cpp)
     target_include_directories(decoderworker_test PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src" "${FFMPEG_ROOT}/include")
     target_link_libraries(decoderworker_test PRIVATE
@@ -94,6 +97,7 @@ if(BUILD_TESTING)
         src/player/playerengine.cpp
         src/player/playbackpolicy.h
         src/player/playbackpolicy.cpp)
+    target_sources(media_smoke PRIVATE src/network/networkpolicy.h src/network/networkpolicy.cpp)
     target_include_directories(media_smoke PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src" "${FFMPEG_ROOT}/include")
     target_link_libraries(media_smoke PRIVATE
@@ -111,6 +115,7 @@ if(BUILD_TESTING)
         src/player/playerengine.cpp
         src/player/playbackpolicy.h
         src/player/playbackpolicy.cpp)
+    target_sources(player_runtime_probe PRIVATE src/network/networkpolicy.h src/network/networkpolicy.cpp)
     target_include_directories(player_runtime_probe PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src" "${FFMPEG_ROOT}/include")
     target_link_libraries(player_runtime_probe PRIVATE
@@ -128,4 +133,36 @@ if(BUILD_TESTING)
     add_test(NAME ffmpeg_sdk_link_and_runtime COMMAND ffmpeg_sdk_smoke)
     set_tests_properties(ffmpeg_sdk_link_and_runtime PROPERTIES
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${FFMPEG_ROOT}/bin")
+
+    qt_add_executable(networkpolicy_test
+        tests/networkpolicy_test.cpp
+        src/network/networkpolicy.h
+        src/network/networkpolicy.cpp)
+    target_include_directories(networkpolicy_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src" "${FFMPEG_ROOT}/include")
+    target_link_libraries(networkpolicy_test PRIVATE Qt6::Test ${FFMPEG_avutil_LIBRARY})
+    add_test(NAME network_policy COMMAND networkpolicy_test)
+    set_tests_properties(network_policy PROPERTIES
+        ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>\;PATH=path_list_prepend:${FFMPEG_ROOT}/bin")
+
+    qt_add_executable(accessibility_test
+        tests/accessibility_test.cpp
+        src/mainwindow.h src/mainwindow.cpp
+        src/playerwidgets.h src/playerwidgets.cpp
+        src/player/playerengine.h src/player/playerengine.cpp
+        src/player/playbackpolicy.h src/player/playbackpolicy.cpp
+        src/network/networkpolicy.h src/network/networkpolicy.cpp)
+    target_include_directories(accessibility_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src" "${FFMPEG_ROOT}/include")
+    target_link_libraries(accessibility_test PRIVATE
+        Qt6::Test Qt6::Widgets Qt6::Multimedia
+        ${FFMPEG_avformat_LIBRARY} ${FFMPEG_avcodec_LIBRARY}
+        ${FFMPEG_avfilter_LIBRARY} ${FFMPEG_swresample_LIBRARY}
+        ${FFMPEG_swscale_LIBRARY} ${FFMPEG_avutil_LIBRARY})
+    add_test(NAME accessibility COMMAND accessibility_test)
+    set_tests_properties(accessibility PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+        ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>\;PATH=path_list_prepend:${FFMPEG_ROOT}/bin")
 endif()
