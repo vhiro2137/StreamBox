@@ -1,0 +1,3 @@
+run_id,test_case_id,status,timestamp_iso8601,elapsed_s,commit,os,hardware_profile,media_id,media_sha256,media_type,network_profile,player_state,cpu_percent,gpu_percent,working_set_mb,private_bytes_mb,threads,handles,net_rx_bytes_s,net_tx_bytes_s,startup_ms,open_ms,first_frame_ms,control_response_ms,seek_ms,switch_ms,decoded_frames,displayed_frames,dropped_frames,stall_count,stall_total_ms,av_sync_offset_ms,error_code,evidence_path,notes
+EXAMPLE_ONLY,NF-RES-001,计划,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,Do not treat this row as a result
+
